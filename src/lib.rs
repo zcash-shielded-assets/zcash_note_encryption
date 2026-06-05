@@ -48,8 +48,20 @@ use note_bytes::NoteBytes;
 pub const OUT_PLAINTEXT_SIZE: usize = 32 + // pk_d
     32; // esk
 pub const AEAD_TAG_SIZE: usize = 16;
+pub const COMPACT_NOTE_SIZE: usize = 1 + 11 + 32 + 24;
+pub const NOTE_PLAINTEXT_SIZE: usize = COMPACT_NOTE_SIZE + 512;
+pub const ENC_CIPHERTEXT_SIZE: usize = NOTE_PLAINTEXT_SIZE + AEAD_TAG_SIZE;
 /// The size of an encrypted outgoing plaintext.
 pub const OUT_CIPHERTEXT_SIZE: usize = OUT_PLAINTEXT_SIZE + AEAD_TAG_SIZE;
+
+/// The plaintext bytes of a vanilla Orchard note.
+pub struct NotePlaintextBytes(pub [u8; NOTE_PLAINTEXT_SIZE]);
+/// The ciphertext bytes of an encrypted vanilla Orchard note.
+pub struct NoteCiphertextBytes(pub [u8; ENC_CIPHERTEXT_SIZE]);
+/// The plaintext bytes of a compact vanilla Orchard note.
+pub struct CompactNotePlaintextBytes(pub [u8; COMPACT_NOTE_SIZE]);
+/// The ciphertext bytes of a compact encrypted vanilla Orchard note.
+pub struct CompactNoteCiphertextBytes(pub [u8; COMPACT_NOTE_SIZE + AEAD_TAG_SIZE]);
 
 /// A symmetric key that can be used to recover a single Sapling or Orchard output.
 pub struct OutgoingCipherKey(pub [u8; 32]);
