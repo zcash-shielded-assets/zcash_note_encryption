@@ -42,14 +42,33 @@ pub mod batch;
 
 pub mod note_bytes;
 
-use note_bytes::NoteBytes;
+use note_bytes::{NoteBytes, NoteBytesData};
+
+/// Vanilla / Ironwood compact note size (version + diversifier + value + rseed).
+pub const COMPACT_NOTE_SIZE: usize = 52;
+
+/// Memo size.
+pub const MEMO_SIZE: usize = 512;
+
+/// Vanilla / Ironwood note plaintext size (compact note + memo).
+pub const NOTE_PLAINTEXT_SIZE: usize = COMPACT_NOTE_SIZE + MEMO_SIZE; // 564
 
 /// The size of [`OutPlaintextBytes`].
 pub const OUT_PLAINTEXT_SIZE: usize = 32 + // pk_d
     32; // esk
 pub const AEAD_TAG_SIZE: usize = 16;
+
+/// Vanilla / Ironwood encrypted note ciphertext size (note plaintext + AEAD tag).
+pub const ENC_CIPHERTEXT_SIZE: usize = NOTE_PLAINTEXT_SIZE + AEAD_TAG_SIZE; // 580
+
 /// The size of an encrypted outgoing plaintext.
 pub const OUT_CIPHERTEXT_SIZE: usize = OUT_PLAINTEXT_SIZE + AEAD_TAG_SIZE;
+
+/// Vanilla / Ironwood note plaintext bytes.
+pub type NotePlaintextBytes = NoteBytesData<NOTE_PLAINTEXT_SIZE>;
+
+/// Vanilla / Ironwood note ciphertext bytes.
+pub type NoteCiphertextBytes = NoteBytesData<ENC_CIPHERTEXT_SIZE>;
 
 /// A symmetric key that can be used to recover a single Sapling or Orchard output.
 pub struct OutgoingCipherKey(pub [u8; 32]);
@@ -234,7 +253,7 @@ pub trait Domain {
     fn parse_note_plaintext_without_memo_ivk(
         &self,
         ivk: &Self::IncomingViewingKey,
-        plaintext: &Self::CompactNotePlaintextBytes,
+        plaintext: &[u8],
     ) -> Option<(Self::Note, Self::Recipient)>;
 
     /// Parses the given note plaintext from the sender's perspective.
@@ -252,7 +271,7 @@ pub trait Domain {
     fn parse_note_plaintext_without_memo_ovk(
         &self,
         pk_d: &Self::DiversifiedTransmissionKey,
-        plaintext: &Self::CompactNotePlaintextBytes,
+        plaintext: &[u8],
     ) -> Option<(Self::Note, Self::Recipient)>;
 
     /// Splits the given note plaintext into the compact part (containing the note) and
@@ -266,6 +285,13 @@ pub trait Domain {
         &self,
         plaintext: &Self::NotePlaintextBytes,
     ) -> Option<(Self::CompactNotePlaintextBytes, Self::Memo)>;
+
+    /// Extracts the memo field from the note plaintext without parsing the compact note.
+    fn extract_memo(&self, plaintext: &Self::NotePlaintextBytes) -> Self::Memo {
+        self.split_plaintext_at_memo(plaintext)
+            .map(|(_, memo)| memo)
+            .expect("split_plaintext_at_memo must succeed for a valid plaintext")
+    }
 
     /// Parses the `DiversifiedTransmissionKey` field of the outgoing plaintext.
     ///
@@ -546,7 +572,7 @@ fn parse_note_plaintext_without_memo_ivk<D: Domain>(
     cmstar_bytes: &D::ExtractedCommitmentBytes,
     plaintext: &D::CompactNotePlaintextBytes,
 ) -> Option<(D::Note, D::Recipient)> {
-    let (note, to) = domain.parse_note_plaintext_without_memo_ivk(ivk, plaintext)?;
+    let (note, to) = domain.parse_note_plaintext_without_memo_ivk(ivk, plaintext.as_ref())?;
 
     if let NoteValidity::Valid = check_note_validity::<D>(&note, ephemeral_key, cmstar_bytes) {
         Some((note, to))
@@ -712,7 +738,7 @@ pub fn try_output_recovery_with_pkd_esk<D: Domain, Output: ShieldedOutput<D>>(
 
     let (compact, memo) = domain.split_plaintext_at_memo(&plaintext)?;
 
-    let (note, to) = domain.parse_note_plaintext_without_memo_ovk(&pk_d, &compact)?;
+    let (note, to) = domain.parse_note_plaintext_without_memo_ovk(&pk_d, compact.as_ref())?;
 
     // ZIP 212: Check that the esk provided to this function is consistent with the esk we can
     // derive from the note. This check corresponds to `ToScalar(PRF^{expand}_{rseed}([4]) = esk`
