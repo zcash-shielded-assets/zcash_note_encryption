@@ -157,6 +157,15 @@ pub trait Domain {
     type ExtractedCommitmentBytes: Eq + for<'a> From<&'a Self::ExtractedCommitment>;
     type Memo;
 
+    /// The compact note plaintext size (version + diversifier + value + rseed).
+    const COMPACT_NOTE_SIZE: usize = 52;
+
+    /// The full note plaintext size (compact note + memo).
+    const NOTE_PLAINTEXT_SIZE: usize = Self::COMPACT_NOTE_SIZE + 512;
+
+    /// The encrypted note ciphertext size (note plaintext + AEAD tag).
+    const ENC_CIPHERTEXT_SIZE: usize = Self::NOTE_PLAINTEXT_SIZE + 16;
+
     type NotePlaintextBytes: NoteBytes;
     type NoteCiphertextBytes: NoteBytes;
     type CompactNotePlaintextBytes: NoteBytes;
