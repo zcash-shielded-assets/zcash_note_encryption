@@ -6,16 +6,20 @@ and this library adheres to Rust's notion of
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+
+### Added
+- `Domain::{COMPACT_NOTE_SIZE, NOTE_PLAINTEXT_SIZE, ENC_CIPHERTEXT_SIZE}`
+  associated constants for domain-specific note sizes.
+- `NoteBytes::zeroed`.
+
 ### Changed
-- **Breaking change:** removed the constants `COMPACT_NOTE_SIZE`,
-  `NOTE_PLAINTEXT_SIZE`, and `ENC_CIPHERTEXT_SIZE` as they are now
-  implementation spesific (located in `orchard` and `sapling-crypto` crates).
 - Generalized the note plaintext size to support variable sizes by adding the
   abstract types `NotePlaintextBytes`, `NoteCiphertextBytes`,
   `CompactNotePlaintextBytes`, and `CompactNoteCiphertextBytes` to the `Domain`
   trait.
-- Removed the separate `NotePlaintextBytes` type definition (as it is now an
-  associated type).
+- Retained the vanilla / Ironwood `COMPACT_NOTE_SIZE`, `NOTE_PLAINTEXT_SIZE`,
+  and `ENC_CIPHERTEXT_SIZE` constants and corresponding byte aliases for
+  downstream compatibility.
 - Added new `parse_note_plaintext_bytes`, `parse_note_ciphertext_bytes`, and
   `parse_compact_note_plaintext_bytes` methods to the `Domain` trait.
 - Updated the `note_plaintext_bytes` method of the `Domain` trait to return the
@@ -27,14 +31,32 @@ and this library adheres to Rust's notion of
   `Option` of a reference instead of a copy.
 - Added a new `note_bytes` module with helper trait and struct to deal with note
   bytes data with abstracted underlying array size.
+- `ShieldedOutput` has added method `cmstar`, which exposes the
+  `ExtractedCommitment` of the shielded output directly, in addition to the
+  byte encoding exposed by `ShieldedOutput::cmstar_bytes`. This is useful for
+  further generalizing scanning code.
+
+## [0.4.2] - 2026-07-11
+
+### Added
+- A blanket `impl<D, O> ShieldedOutput<D> for &O` where
+  `D: Domain, O: ShieldedOutput<D>`.
+- `BatchDomain::batch_ka_agree_dec`, a provided method that computes
+  `Domain::ka_agree_dec` for a batch of prepared ephemeral keys against a single
+  incoming viewing key. Domains for which same-scalar multiplications can share
+  work can override it; the default implementation (and therefore the behavior
+  of existing `BatchDomain` implementations) is the per-item computation. The
+  batch decryption functions in the `batch` module now derive their shared
+  secrets through this method, one call per viewing key.
 
 ## [0.4.1] - 2024-12-06
+
 ### Added
 - `zcash_note_encryption::try_output_recovery_with_pkd_esk`
 
 ## [0.4.0] - 2023-06-06
 ### Changed
-- The `esk` and `ephemeral_key` arguments have been removed from 
+- The `esk` and `ephemeral_key` arguments have been removed from
   `Domain::parse_note_plaintext_without_memo_ovk`. It is therefore no longer
   necessary (or possible) to ensure that `ephemeral_key` is derived from `esk`
   and the diversifier within the note plaintext. We have analyzed the safety of
@@ -46,7 +68,7 @@ and this library adheres to Rust's notion of
 ## [0.3.0] - 2023-03-22
 ### Changed
 - The `recipient` parameter has been removed from `Domain::note_plaintext_bytes`.
-- The `recipient` parameter has been removed from `NoteEncryption::new`. Since 
+- The `recipient` parameter has been removed from `NoteEncryption::new`. Since
   the `Domain::Note` type is now expected to contain information about the
   recipient of the note, there is no longer any need to pass this information
   in via the encryption context.

@@ -5,11 +5,11 @@
 //! and trial decryption logic, and enforce protocol-agnostic verification requirements.
 //!
 //! Protocol-specific logic is handled via the [`Domain`] trait. Implementations of this
-//! trait are provided in the [`zcash_primitives`] (for Sapling) and [`orchard`] crates;
-//! users with their own existing types can similarly implement the trait themselves.
+//! trait are provided in the [`sapling-crypto`] and [`orchard`] crates; users with their
+//! own existing types can similarly implement the trait themselves.
 //!
 //! [in-band secret distribution scheme]: https://zips.z.cash/protocol/protocol.pdf#saplingandorchardinband
-//! [`zcash_primitives`]: https://crates.io/crates/zcash_primitives
+//! [`sapling-crypto`]: https://crates.io/crates/sapling-crypto
 //! [`orchard`]: https://crates.io/crates/orchard
 
 #![no_std]
@@ -51,7 +51,7 @@ pub const COMPACT_NOTE_SIZE: usize = 52;
 pub const MEMO_SIZE: usize = 512;
 
 /// Vanilla / Ironwood note plaintext size (compact note + memo).
-pub const NOTE_PLAINTEXT_SIZE: usize = COMPACT_NOTE_SIZE + MEMO_SIZE; // 564
+pub const NOTE_PLAINTEXT_SIZE: usize = COMPACT_NOTE_SIZE + MEMO_SIZE;
 
 /// The size of [`OutPlaintextBytes`].
 pub const OUT_PLAINTEXT_SIZE: usize = 32 + // pk_d
@@ -59,7 +59,7 @@ pub const OUT_PLAINTEXT_SIZE: usize = 32 + // pk_d
 pub const AEAD_TAG_SIZE: usize = 16;
 
 /// Vanilla / Ironwood encrypted note ciphertext size (note plaintext + AEAD tag).
-pub const ENC_CIPHERTEXT_SIZE: usize = NOTE_PLAINTEXT_SIZE + AEAD_TAG_SIZE; // 580
+pub const ENC_CIPHERTEXT_SIZE: usize = NOTE_PLAINTEXT_SIZE + AEAD_TAG_SIZE;
 
 /// The size of an encrypted outgoing plaintext.
 pub const OUT_CIPHERTEXT_SIZE: usize = OUT_PLAINTEXT_SIZE + AEAD_TAG_SIZE;
@@ -158,13 +158,13 @@ pub trait Domain {
     type Memo;
 
     /// The compact note plaintext size (version + diversifier + value + rseed).
-    const COMPACT_NOTE_SIZE: usize = 52;
+    const COMPACT_NOTE_SIZE: usize = crate::COMPACT_NOTE_SIZE;
 
     /// The full note plaintext size (compact note + memo).
-    const NOTE_PLAINTEXT_SIZE: usize = Self::COMPACT_NOTE_SIZE + 512;
+    const NOTE_PLAINTEXT_SIZE: usize = Self::COMPACT_NOTE_SIZE + MEMO_SIZE;
 
     /// The encrypted note ciphertext size (note plaintext + AEAD tag).
-    const ENC_CIPHERTEXT_SIZE: usize = Self::NOTE_PLAINTEXT_SIZE + 16;
+    const ENC_CIPHERTEXT_SIZE: usize = Self::NOTE_PLAINTEXT_SIZE + AEAD_TAG_SIZE;
 
     type NotePlaintextBytes: NoteBytes;
     type NoteCiphertextBytes: NoteBytes;
@@ -316,7 +316,7 @@ pub trait Domain {
 
     /// Parses the given note plaintext bytes.
     ///
-    /// Returns `None` if the byte slice does not represent a valid note plaintext.
+    /// Returns `None` if the byte slice has the wrong length for a note plaintext.
     fn parse_note_plaintext_bytes(plaintext: &[u8]) -> Option<Self::NotePlaintextBytes> {
         Self::NotePlaintextBytes::from_slice(plaintext)
     }
@@ -325,7 +325,7 @@ pub trait Domain {
     ///
     /// `output` is the ciphertext bytes, and `tag` is the authentication tag.
     ///
-    /// Returns `None` if the byte slice does not represent a valid note ciphertext.
+    /// Returns `None` if the `output` byte slice has the wrong length for a note ciphertext.
     fn parse_note_ciphertext_bytes(
         output: &[u8],
         tag: [u8; AEAD_TAG_SIZE],
@@ -335,7 +335,7 @@ pub trait Domain {
 
     /// Parses the given compact note plaintext bytes.
     ///
-    /// Returns `None` if the byte slice does not represent a valid compact note plaintext.
+    /// Returns `None` if the byte slice has the wrong length for a compact note plaintext.
     fn parse_compact_note_plaintext_bytes(
         plaintext: &[u8],
     ) -> Option<Self::CompactNotePlaintextBytes> {
@@ -384,6 +384,29 @@ pub trait BatchDomain: Domain {
             })
             .collect()
     }
+
+    /// Computes `Self::ka_agree_dec` on a batch of prepared ephemeral keys against a
+    /// single incoming viewing key.
+    ///
+    /// For each item, if the prepared ephemeral key is `None` (i.e. its encoding could
+    /// not be parsed), this returns `None` at that position.
+    ///
+    /// Trial decryption multiplies many ephemeral keys by the same viewing key, so
+    /// domains for which same-scalar multiplications can share work (for example,
+    /// lockstep ladders over a shared batched field inversion) can override this to
+    /// reduce the cost of the scalar multiplications, which dominate batched trial
+    /// decryption. The default implementation performs the per-item computation.
+    fn batch_ka_agree_dec<'a>(
+        ivk: &Self::IncomingViewingKey,
+        epks: impl Iterator<Item = Option<&'a Self::PreparedEphemeralPublicKey>>,
+    ) -> Vec<Option<Self::SharedSecret>>
+    where
+        Self::PreparedEphemeralPublicKey: 'a,
+    {
+        // Default implementation: do the non-batched thing.
+        epks.map(|epk| epk.map(|epk| Self::ka_agree_dec(ivk, epk)))
+            .collect()
+    }
 }
 
 /// Trait that provides access to the components of an encrypted transaction output.
@@ -391,8 +414,13 @@ pub trait ShieldedOutput<D: Domain> {
     /// Exposes the `ephemeral_key` field of the output.
     fn ephemeral_key(&self) -> EphemeralKeyBytes;
 
-    /// Exposes the `cmu_bytes` or `cmx_bytes` field of the output.
-    fn cmstar_bytes(&self) -> D::ExtractedCommitmentBytes;
+    /// Exposes the `cmu` or `cmx` field of the output.
+    fn cmstar(&self) -> &D::ExtractedCommitment;
+
+    /// Exposes the `cmu_bytes` or `cmx_bytes` representation of the output.
+    fn cmstar_bytes(&self) -> D::ExtractedCommitmentBytes {
+        D::ExtractedCommitmentBytes::from(self.cmstar())
+    }
 
     /// Exposes the note ciphertext of the output. Returns `None` if the output is compact.
     fn enc_ciphertext(&self) -> Option<&D::NoteCiphertextBytes>;
@@ -403,17 +431,46 @@ pub trait ShieldedOutput<D: Domain> {
     fn enc_ciphertext_compact(&self) -> D::CompactNoteCiphertextBytes;
 
     //// Splits the AEAD tag from the ciphertext.
+    ///
+    /// Returns `None` if the output is compact.
     fn split_ciphertext_at_tag(&self) -> Option<(D::NotePlaintextBytes, [u8; AEAD_TAG_SIZE])> {
         let enc_ciphertext_bytes = self.enc_ciphertext()?.as_ref();
 
-        let (plaintext, tail) = enc_ciphertext_bytes
+        let tag_loc = enc_ciphertext_bytes
             .len()
             .checked_sub(AEAD_TAG_SIZE)
-            .map(|tag_loc| enc_ciphertext_bytes.split_at(tag_loc))?;
+            .expect("D::CompactNoteCiphertextBytes should be at least AEAD_TAG_SIZE bytes");
+        let (plaintext, tail) = enc_ciphertext_bytes.split_at(tag_loc);
 
         let tag: [u8; AEAD_TAG_SIZE] = tail.try_into().expect("the length of the tag is correct");
 
-        D::parse_note_plaintext_bytes(plaintext).map(|plaintext| (plaintext, tag))
+        Some((
+            D::parse_note_plaintext_bytes(plaintext)
+                .expect("D::NoteCiphertextBytes and D::NotePlaintextBytes should be consistent"),
+            tag,
+        ))
+    }
+}
+
+impl<D, O> ShieldedOutput<D> for &O
+where
+    D: Domain,
+    O: ShieldedOutput<D>,
+{
+    fn ephemeral_key(&self) -> EphemeralKeyBytes {
+        (*self).ephemeral_key()
+    }
+
+    fn cmstar(&self) -> &<D as Domain>::ExtractedCommitment {
+        (*self).cmstar()
+    }
+
+    fn enc_ciphertext(&self) -> Option<&<D as Domain>::NoteCiphertextBytes> {
+        (*self).enc_ciphertext()
+    }
+
+    fn enc_ciphertext_compact(&self) -> <D as Domain>::CompactNoteCiphertextBytes {
+        (*self).enc_ciphertext_compact()
     }
 }
 
