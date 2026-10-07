@@ -45,7 +45,7 @@ and this library adheres to Rust's notion of
 
 ### Changed
 - MSRV is now 1.88.
-- Migrated to `rand_core 0.10`. The `NoteEncryption::encrypt_outgoing_plaintext` 
+- Migrated to `rand_core 0.10`. The `NoteEncryption::encrypt_outgoing_plaintext`
   method now requires its `rng` argument to implement `rand_core::Rng` instead
   of `rand_core::RngCore`, as the latter trait is deprecated in `rand_core 0.10`.
 - The `Domain` trait has added associated `NotePlaintextBytes`,
