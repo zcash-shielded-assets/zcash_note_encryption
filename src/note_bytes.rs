@@ -19,8 +19,11 @@ pub trait NoteBytes: AsRef<[u8]> + AsMut<[u8]> + Clone + Copy {
     /// Creates a zeroed instance of this fixed-size byte array.
     fn zeroed() -> Self;
 
+    /// Constructs a value from a byte slice, returning `None` if the length does not match.
     fn from_slice(bytes: &[u8]) -> Option<Self>;
 
+    /// Constructs a value by concatenating `output` with `tag`, returning `None` if the
+    /// combined length does not match.
     fn from_slice_with_tag<const TAG_SIZE: usize>(
         output: &[u8],
         tag: [u8; TAG_SIZE],

@@ -17,7 +17,7 @@
 // Catch documentation errors caused by code changes.
 #![deny(rustdoc::broken_intra_doc_links)]
 #![deny(unsafe_code)]
-// TODO: #![deny(missing_docs)]
+#![deny(missing_docs)]
 
 use core::fmt::{self, Write};
 
@@ -30,16 +30,17 @@ use chacha20::{
     cipher::{StreamCipher, StreamCipherSeek},
     ChaCha20,
 };
-use chacha20poly1305::{aead::AeadInPlace, ChaCha20Poly1305, KeyInit};
+use chacha20poly1305::{AeadInOut, ChaCha20Poly1305, KeyInit, Nonce};
 use cipher::KeyIvInit;
 
-use rand_core::RngCore;
+use rand_core::Rng;
 use subtle::{Choice, ConstantTimeEq};
 
 #[cfg(feature = "alloc")]
 #[cfg_attr(docsrs, doc(cfg(feature = "alloc")))]
 pub mod batch;
 
+/// Types and traits for handling fixed-size byte arrays used in note encryption.
 pub mod note_bytes;
 
 use note_bytes::{NoteBytes, NoteBytesData};
@@ -56,6 +57,7 @@ pub const NOTE_PLAINTEXT_SIZE: usize = COMPACT_NOTE_SIZE + MEMO_SIZE;
 /// The size of [`OutPlaintextBytes`].
 pub const OUT_PLAINTEXT_SIZE: usize = 32 + // pk_d
     32; // esk
+/// The size of the authentication tag used by the AEAD.
 pub const AEAD_TAG_SIZE: usize = 16;
 
 /// Vanilla / Ironwood encrypted note ciphertext size (note plaintext + AEAD tag).
@@ -98,7 +100,7 @@ impl fmt::Debug for EphemeralKeyBytes {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
                 f.write_char('"')?;
                 for b in self.0 {
-                    f.write_fmt(format_args!("{:02x}", b))?;
+                    f.write_fmt(format_args!("{b:02x}"))?;
                 }
                 f.write_char('"')
             }
@@ -141,20 +143,51 @@ enum NoteValidity {
 ///
 /// This trait enables most of the note encryption logic to be shared between Sapling and
 /// Orchard, as well as between different implementations of those protocols.
+///
+/// Concrete implementations are provided for Sapling and Orchard in their respective
+/// `note_encryption` modules: [`SaplingDomain`][sapling-impl] and
+/// [`OrchardDomain`][orchard-impl].
+///
+/// [sapling-impl]: https://github.com/zcash/sapling-crypto/blob/main/src/note_encryption.rs
+/// [orchard-impl]: https://github.com/zcash/orchard/blob/main/src/note_encryption.rs
 pub trait Domain {
+    /// The ephemeral secret key used to derive the shared secret.
     type EphemeralSecretKey: ConstantTimeEq;
+    /// The ephemeral public key transmitted with the output.
     type EphemeralPublicKey;
+    /// A precomputed form of [`Self::EphemeralPublicKey`] for key agreement.
     type PreparedEphemeralPublicKey;
+    /// The shared secret produced by Diffie-Hellman key agreement.
     type SharedSecret;
+    /// The symmetric key derived from the shared secret.
     type SymmetricKey: AsRef<[u8]>;
+    /// The note being encrypted.
     type Note;
+    /// The recipient of the note.
     type Recipient;
+    /// The diversified transmission key of the recipient.
     type DiversifiedTransmissionKey;
+    /// The incoming viewing key used to decrypt notes by the recipient.
+    ///
+    /// See [section 4.20.2: Decryption using an Incoming Viewing Key (Sapling and
+    /// Orchard)][decryptivk] of the Zcash Protocol Specification.
+    ///
+    /// [decryptivk]: https://zips.z.cash/protocol/protocol.pdf#decryptivk
     type IncomingViewingKey;
+    /// The outgoing viewing key used to decrypt notes by the sender.
+    ///
+    /// See [section 4.20.3: Decryption using an Outgoing Viewing Key (Sapling and
+    /// Orchard)][decryptovk] of the Zcash Protocol Specification.
+    ///
+    /// [decryptovk]: https://zips.z.cash/protocol/protocol.pdf#decryptovk
     type OutgoingViewingKey;
+    /// The commitment to the value of the note.
     type ValueCommitment;
+    /// The note commitment.
     type ExtractedCommitment;
+    /// The byte representation of an [`Self::ExtractedCommitment`].
     type ExtractedCommitmentBytes: Eq + for<'a> From<&'a Self::ExtractedCommitment>;
+    /// The memo field associated with the note.
     type Memo;
 
     /// The compact note plaintext size (version + diversifier + value + rseed).
@@ -166,9 +199,13 @@ pub trait Domain {
     /// The encrypted note ciphertext size (note plaintext + AEAD tag).
     const ENC_CIPHERTEXT_SIZE: usize = Self::NOTE_PLAINTEXT_SIZE + AEAD_TAG_SIZE;
 
+    /// The byte representation of a note plaintext.
     type NotePlaintextBytes: NoteBytes;
+    /// The byte representation of an encrypted note.
     type NoteCiphertextBytes: NoteBytes;
+    /// The byte representation of a compact note plaintext.
     type CompactNotePlaintextBytes: NoteBytes;
+    /// The byte representation of an encrypted compact note.
     type CompactNoteCiphertextBytes: NoteBytes;
 
     /// Derives the `EphemeralSecretKey` corresponding to this note.
@@ -430,7 +467,7 @@ pub trait ShieldedOutput<D: Domain> {
     /// Exposes the compact note ciphertext of the output.
     fn enc_ciphertext_compact(&self) -> D::CompactNoteCiphertextBytes;
 
-    //// Splits the AEAD tag from the ciphertext.
+    /// Splits the AEAD tag from the ciphertext.
     ///
     /// Returns `None` if the output is compact.
     fn split_ciphertext_at_tag(&self) -> Option<(D::NotePlaintextBytes, [u8; AEAD_TAG_SIZE])> {
@@ -480,8 +517,8 @@ where
 /// enforces that fresh ephemeral keys are used for every note, and that the ciphertexts are
 /// consistent with each other.
 ///
-/// Implements section 4.19 of the
-/// [Zcash Protocol Specification](https://zips.z.cash/protocol/nu5.pdf#saplingandorchardinband)
+/// Implements section 4.20.1: Encryption (Sapling and Orchard) of the
+/// [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf#saplingandorchardencrypt)
 pub struct NoteEncryption<D: Domain> {
     epk: D::EphemeralPublicKey,
     esk: D::EphemeralSecretKey,
@@ -544,14 +581,15 @@ impl<D: Domain> NoteEncryption<D> {
 
         let output = input.as_mut();
 
-        let tag = ChaCha20Poly1305::new(key.as_ref().into())
-            .encrypt_in_place_detached([0u8; 12][..].into(), &[], output)
+        let tag = ChaCha20Poly1305::new_from_slice(key.as_ref())
+            .expect("the symmetric key is 32 bytes")
+            .encrypt_inout_detached(&Nonce::default(), &[], output.into())
             .unwrap();
         D::parse_note_ciphertext_bytes(output, tag.into()).expect("the output length is correct")
     }
 
     /// Generates `outCiphertext` for this note.
-    pub fn encrypt_outgoing_plaintext<R: RngCore>(
+    pub fn encrypt_outgoing_plaintext<R: Rng>(
         &self,
         cv: &D::ValueCommitment,
         cmstar: &D::ExtractedCommitment,
@@ -575,8 +613,12 @@ impl<D: Domain> NoteEncryption<D> {
 
         let mut output = [0u8; OUT_CIPHERTEXT_SIZE];
         output[..OUT_PLAINTEXT_SIZE].copy_from_slice(&input.0);
-        let tag = ChaCha20Poly1305::new(ock.as_ref().into())
-            .encrypt_in_place_detached([0u8; 12][..].into(), &[], &mut output[..OUT_PLAINTEXT_SIZE])
+        let tag = ChaCha20Poly1305::new(&ock.0.into())
+            .encrypt_inout_detached(
+                &Nonce::default(),
+                &[],
+                (&mut output[..OUT_PLAINTEXT_SIZE]).into(),
+            )
             .unwrap();
         output[OUT_PLAINTEXT_SIZE..].copy_from_slice(&tag);
 
@@ -590,8 +632,8 @@ impl<D: Domain> NoteEncryption<D> {
 /// If successful, the corresponding note and memo are returned, along with the address to
 /// which the note was sent.
 ///
-/// Implements section 4.19.2 of the
-/// [Zcash Protocol Specification](https://zips.z.cash/protocol/nu5.pdf#decryptivk).
+/// Implements section 4.20.2 of the
+/// [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf#decryptivk).
 pub fn try_note_decryption<D: Domain, Output: ShieldedOutput<D>>(
     domain: &D,
     ivk: &D::IncomingViewingKey,
@@ -615,8 +657,14 @@ fn try_note_decryption_inner<D: Domain, Output: ShieldedOutput<D>>(
 ) -> Option<(D::Note, D::Recipient, D::Memo)> {
     let (mut plaintext, tag) = output.split_ciphertext_at_tag()?;
 
-    ChaCha20Poly1305::new(key.as_ref().into())
-        .decrypt_in_place_detached([0u8; 12][..].into(), &[], plaintext.as_mut(), &tag.into())
+    ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .ok()?
+        .decrypt_inout_detached(
+            &Nonce::default(),
+            &[],
+            plaintext.as_mut().into(),
+            &tag.into(),
+        )
         .ok()?;
 
     let (compact, memo) = domain.split_plaintext_at_memo(&plaintext)?;
@@ -653,7 +701,7 @@ fn check_note_validity<D: Domain>(
     cmstar_bytes: &D::ExtractedCommitmentBytes,
 ) -> NoteValidity {
     if &D::ExtractedCommitmentBytes::from(&D::cmstar(note)) == cmstar_bytes {
-        // In the case corresponding to specification section 4.19.3, we check that `esk` is equal
+        // In the case corresponding to specification section 4.20.3, we check that `esk` is equal
         // to `D::derive_esk(note)` prior to calling this method.
         if let Some(derived_esk) = D::derive_esk(note) {
             if D::epk_bytes(&D::ka_derive_public(note, &derived_esk))
@@ -708,7 +756,7 @@ fn try_compact_note_decryption_inner<D: Domain, Output: ShieldedOutput<D>>(
     let mut plaintext: D::CompactNotePlaintextBytes =
         D::parse_compact_note_plaintext_bytes(output.enc_ciphertext_compact().as_ref())?;
 
-    let mut keystream = ChaCha20::new(key.as_ref().into(), [0u8; 12][..].into());
+    let mut keystream = ChaCha20::new_from_slices(key.as_ref(), &[0u8; 12]).ok()?;
     keystream.seek(64);
     keystream.apply_keystream(plaintext.as_mut());
 
@@ -727,9 +775,9 @@ fn try_compact_note_decryption_inner<D: Domain, Output: ShieldedOutput<D>>(
 /// If successful, the corresponding note and memo are returned, along with the address to
 /// which the note was sent.
 ///
-/// Implements [Zcash Protocol Specification section 4.19.3][decryptovk].
+/// Implements [Zcash Protocol Specification section 4.20.3][decryptovk].
 ///
-/// [decryptovk]: https://zips.z.cash/protocol/nu5.pdf#decryptovk
+/// [decryptovk]: https://zips.z.cash/protocol/protocol.pdf#decryptovk
 pub fn try_output_recovery_with_ovk<D: Domain, Output: ShieldedOutput<D>>(
     domain: &D,
     ovk: &D::OutgoingViewingKey,
@@ -747,8 +795,8 @@ pub fn try_output_recovery_with_ovk<D: Domain, Output: ShieldedOutput<D>>(
 /// If successful, the corresponding note and memo are returned, along with the address to
 /// which the note was sent.
 ///
-/// Implements part of section 4.19.3 of the
-/// [Zcash Protocol Specification](https://zips.z.cash/protocol/nu5.pdf#decryptovk).
+/// Implements part of section 4.20.3 of the
+/// [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf#decryptovk).
 /// For decryption using a Full Viewing Key see [`try_output_recovery_with_ovk`].
 pub fn try_output_recovery_with_ock<D: Domain, Output: ShieldedOutput<D>>(
     domain: &D,
@@ -759,13 +807,9 @@ pub fn try_output_recovery_with_ock<D: Domain, Output: ShieldedOutput<D>>(
     let mut op = OutPlaintextBytes([0; OUT_PLAINTEXT_SIZE]);
     op.0.copy_from_slice(&out_ciphertext[..OUT_PLAINTEXT_SIZE]);
 
-    ChaCha20Poly1305::new(ock.as_ref().into())
-        .decrypt_in_place_detached(
-            [0u8; 12][..].into(),
-            &[],
-            &mut op.0,
-            out_ciphertext[OUT_PLAINTEXT_SIZE..].into(),
-        )
+    let tag: [u8; AEAD_TAG_SIZE] = out_ciphertext[OUT_PLAINTEXT_SIZE..].try_into().ok()?;
+    ChaCha20Poly1305::new(&ock.0.into())
+        .decrypt_inout_detached(&Nonce::default(), &[], (&mut op.0[..]).into(), &tag.into())
         .ok()?;
 
     let pk_d = D::extract_pk_d(&op)?;
@@ -780,8 +824,8 @@ pub fn try_output_recovery_with_ock<D: Domain, Output: ShieldedOutput<D>>(
 /// successful, the corresponding note and memo are returned, along with the address to which the
 /// note was sent.
 ///
-/// Implements part of section 4.19.3 of the
-/// [Zcash Protocol Specification](https://zips.z.cash/protocol/nu5.pdf#decryptovk).
+/// Implements part of section 4.20.3 of the
+/// [Zcash Protocol Specification](https://zips.z.cash/protocol/protocol.pdf#decryptovk).
 /// For decryption using a Full Viewing Key see [`try_output_recovery_with_ovk`].
 pub fn try_output_recovery_with_pkd_esk<D: Domain, Output: ShieldedOutput<D>>(
     domain: &D,
@@ -798,8 +842,14 @@ pub fn try_output_recovery_with_pkd_esk<D: Domain, Output: ShieldedOutput<D>>(
 
     let (mut plaintext, tag) = output.split_ciphertext_at_tag()?;
 
-    ChaCha20Poly1305::new(key.as_ref().into())
-        .decrypt_in_place_detached([0u8; 12][..].into(), &[], plaintext.as_mut(), &tag.into())
+    ChaCha20Poly1305::new_from_slice(key.as_ref())
+        .ok()?
+        .decrypt_inout_detached(
+            &Nonce::default(),
+            &[],
+            plaintext.as_mut().into(),
+            &tag.into(),
+        )
         .ok()?;
 
     let (compact, memo) = domain.split_plaintext_at_memo(&plaintext)?;
@@ -807,8 +857,10 @@ pub fn try_output_recovery_with_pkd_esk<D: Domain, Output: ShieldedOutput<D>>(
     let (note, to) = domain.parse_note_plaintext_without_memo_ovk(&pk_d, compact.as_ref())?;
 
     // ZIP 212: Check that the esk provided to this function is consistent with the esk we can
-    // derive from the note. This check corresponds to `ToScalar(PRF^{expand}_{rseed}([4]) = esk`
-    // in https://zips.z.cash/protocol/protocol.pdf#decryptovk. (`ρ^opt = []` for Sapling.)
+    // derive from the note. This check corresponds to
+    // `ToScalar(PRF^{expand}_{rseed}(pre_esk)) = esk` in
+    // https://zips.z.cash/protocol/protocol.pdf#decryptovk, where `pre_esk = [5]` for Sapling
+    // and `pre_esk = [4] || ρ` for Orchard.
     if let Some(derived_esk) = D::derive_esk(&note) {
         if (!derived_esk.ct_eq(&esk)).into() {
             return None;
